@@ -513,6 +513,8 @@ else {
 
 #### main script ####
 
+# check to see if NMW app already has vnet integration enabled
+
 # Get all existing private endpoints
 $ExistingPrivateEndpoints = Get-AzPrivateEndpoint -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue
 
@@ -1241,13 +1243,13 @@ if ($NmeRtiKeyVaultName) {
     # Get rti key vault
     $NmeRtiKeyVault = Get-AzKeyVault -ResourceGroupName $NmeRg -VaultName $NmeRtiKeyVaultName
     # check if rti key vault private endpoint is created
-    $RtiKvPrivateEndpoint = $ExistingPrivateEndpoints | Where-Object { $_.PrivateLinkServiceConnections.PrivateLinkServiceId -eq $NmeRtiKeyVault.Id }
+    $RtiKvPrivateEndpoint = $ExistingPrivateEndpoints | Where-Object { $_.PrivateLinkServiceConnections.PrivateLinkServiceId -eq $NmeRtiKeyVault.ResourceId }
     if ($RtiKvPrivateEndpoint) {
         Write-Output "Found RTI Key Vault private endpoint"
     } 
     else {
         Write-Output "Configuring RTI Key Vault service connection and private endpoint"
-        $RtiKvServiceConnection = New-AzPrivateLinkServiceConnection -Name $RtiKvServiceConnectionName -PrivateLinkServiceId $NmeRtiKeyVault.Id -GroupId vault 
+        $RtiKvServiceConnection = New-AzPrivateLinkServiceConnection -Name $RtiKvServiceConnectionName -PrivateLinkServiceId $NmeRtiKeyVault.ResourceId -GroupId vault 
         $RtiKvPrivateEndpoint = New-AzPrivateEndpoint -Name "$RtiKvPrivateEndpointName" -ResourceGroupName $NmeRg -Location $NmeRegion -Subnet $PrivateEndpointSubnet -PrivateLinkServiceConnection $RtiKvServiceConnection 
     }
     # check if rti key vault dns zone group created
