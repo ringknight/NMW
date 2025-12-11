@@ -75,11 +75,6 @@ endpoint vnet.
     "IsRequired": false,
     "DefaultValue": ""
   },
-  "MakeAzureMonitorPrivate": {
-    "Description": "WARNING: Because Azure Monitor uses some shared endpoints, setting up a private link even for a single resource changes the DNS configuration that affects traffic to all resources. You may not want to enable this if you have existing Log Analytics Workspaces or Insights. To minimize potential impact, this script sets ingestion and query access mode to 'Open' and disables public access on the Nerdio Manager resources only. This can be modified by cloning this script and modifying the AMPLS settings variables below.",
-    "IsRequired": false,
-    "DefaultValue": "false"
-  },
   "MakeAppServicePrivate": {
     "Description": "WARNING: If set to true, only hosts on the VNet created by this script, or on peered VNets, will be able to access the app service URL.",
     "IsRequired": false,
@@ -101,9 +96,11 @@ function Set-NmeVars {
         [Parameter(Mandatory=$true)]
         [string]$keyvaultName
     )
+    write-output "Getting NME app resources"
     Write-Verbose "Getting Nerdio Manager key vault"
     $script:NmeKeyVault = Get-AzKeyVault -VaultName $keyvaultName
     $script:NmeRg = $NmeKeyVault.ResourceGroupName
+    $NmeResourceTagName = "NMW_RESOURCE"
     $keyvaultTags = $NmeKeyVault.Tags
     $key = $keyvaultTags.GetEnumerator() | Where-Object { $_.Value -eq "PAAS" } | Select-Object -ExpandProperty Name
     if (!$Key) {
@@ -113,6 +110,33 @@ function Set-NmeVars {
     else {
         $key = 'NMW_OBJECT_TYPE'
     }
+    Write-Verbose "Getting Nerdio Manager sql server"
+    # First check to see if there's a sql server with tag "$Prefix`_RESOURCE" and value "PRIMARY_SQL_SERVER"
+    $SqlServer = Get-AzSqlServer -ResourceGroupName $nmerg | Where-Object {$_.tags[$NmeResourceTagName] -eq 'PRIMARY_SQL_SERVER'}
+
+    # if we didn't find a sql server, fall back to previous method of finding the sql server
+    if (!$SqlServer) {
+        if ($key){
+            $SqlServer = Get-AzSqlServer -ResourceGroupName $nmerg | ? ServerName -NotMatch '-secondary' | Where-Object {$_.tags[$key] -ne 'INTUNE_INSIGHTS_DEPLOYMENT_RESOURCE' -and $_.tags[$key] -ne 'EIDO_DEPLOYMENT_RESOURCE' -and $_.tags[$key] -ne 'REAL_TIME_INSIGHTS_DEPLOYMENT_RESOURCE' -and $_.tags[$key] -ne'NERDIO_COPILOT_DEPLOYMENT_RESOURCE'}
+        }
+        else {
+            $SqlServer = Get-AzSqlServer -ResourceGroupName $nmerg | ? ServerName -NotMatch '-secondary'
+        }
+        if ($SqlServer.count -ne 1) {
+            Throw "Unable to find NME sql server. Please add the tag '$NmeResourceTagName' with value 'PRIMARY_SQL_SERVER' to the primary sql server used by Nerdio Manager and rerun this script."
+        }
+        else {
+            $script:NmeSqlServerName = $SqlServer.ServerName
+        }
+    }
+    # look for secondary sql server with tag "$NmeResourceTagName" and value "SECONDARY_SQL_SERVER"
+    $SqlSecondary = Get-AzSqlServer -ResourceGroupName $nmerg | Where-Object {$_.tags[$NmeResourceTagName] -eq 'SECONDARY_SQL_SERVER'}
+    if (!($SqlSecondary)){ $SqlSecondary = Get-AzSqlServer -ResourceGroupName $nmerg | ? ServerName -Match '-secondary' }
+    if ($SqlSecondary) {
+        $script:NmeSqlSecondaryServerName = $SqlSecondary.ServerName
+    }
+    $script:NmeSqlDbName = (Get-AzSqlDatabase -ResourceGroupName $nmeRg -ServerName $nmeSqlServerName | Where-Object DatabaseName -ne 'master').DatabaseName
+
     if ($key) {
         $cclwebapp = Get-AzWebApp -ResourceGroupName $NmeRg | Where-Object { $_.Tags.Keys -contains $key } | Where-Object {$_.tags[$key] -eq 'CC_DEPLOYMENT_RESOURCE'}
         if ($cclwebapp) {
@@ -150,23 +174,43 @@ function Set-NmeVars {
         }
 
     }
+   
     Write-Verbose "Getting DPS Storage Account"
-    $script:NmeDpsStorageAccountName = Get-AzStorageAccount -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object { $_.StorageAccountName -match "^dps" } | Select-Object -ExpandProperty StorageAccountName
+    # try get dps storage account by tag using nmeresourcetagname
+    $script:NmeDpsStorageAccountName = get-azstorageaccount -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object {$_.tags[$NmeResourceTagName] -eq 'DPS_STORAGE_ACCOUNT'} | Select-Object -ExpandProperty StorageAccountName
+    if (!$script:NmeDpsStorageAccountName) {
+        Write-Verbose "DPS storage account not found by tag, trying by name pattern"
+        $script:NmeDpsStorageAccountName = Get-AzStorageAccount -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object { $_.StorageAccountName -match "^dps" } | Select-Object -ExpandProperty StorageAccountName
+    }
     if ($script:NmeDpsStorageAccountName.count -ne 1) {
-        Write-Error "Unable to find DPS storage account"
+        Write-Warning "Unable to find DPS storage account. If you are using dps and would like the to put storage account on private endpoints, please add the tag '$NmeResourceTagName' with value 'DPS_STORAGE_ACCOUNT' to the DPS storage account used by Nerdio Manager and rerun this script."
     }
+    
     Write-Verbose "Getting Nerdio Manager web app"
-    $webapps = Get-AzWebApp -ResourceGroupName $NmeRg 
-    if ($webapps){
-        $script:NmeWebApp = $webapps | Where-Object { ($_.siteconfig.appsettings | where-object name -eq "Deployment:KeyVaultName" | Select-Object -ExpandProperty value) -eq $keyvaultName }
+    # try get nme web app by tag using nmeresourcetagname
+    $script:NmeWebApp = Get-AzWebApp -ResourceGroupName $NmeRg | Where-Object {$_.tags[$NmeResourceTagName] -eq 'NERDIO_MANAGER_WEBAPP'}
+    if (!$NmeWebApp) {
+        Write-Verbose "NME web app not found by tag, trying by key"
+            $webapps = Get-AzWebApp -ResourceGroupName $NmeRg 
+        if ($webapps){
+            $script:NmeWebApp = $webapps | Where-Object { ($_.siteconfig.appsettings | where-object name -eq "Deployment:KeyVaultName" | Select-Object -ExpandProperty value) -eq $keyvaultName }
+        }
+        else {
+            throw "Unable to find Nerdio Manager web app. Please add the tag '$NmeResourceTagName' with value 'NERDIO_MANAGER_WEBAPP' to the Nerdio Manager web app and rerun this script."
+        }
     }
-    else {
-        throw "Unable to find Nerdio Manager web app"
+
+    write-verbose "Getting Nerdio Manager Application Insights"
+    # try get nme app insights by tag using nmeresourcetagname
+    try {
+        $NmeAppInsights = Get-AzApplicationInsights -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object {$_.tags[$NmeResourceTagName] -eq 'NERDIO_MANAGER_APPINSIGHTS' }
+    } catch{}
+    if (!$NmeAppInsights) {
+        Write-Verbose "NME App Insights not found by tag, trying by instrumentation key"
+        $NmeAppInsights = Get-AzApplicationInsights -ResourceGroupName $NmeRg | Where-Object { $_.InstrumentationKey -eq ($NmeWebApp.siteconfig.appsettings | Where-Object  {$_.name -eq 'ApplicationInsights:InstrumentationKey'} | Select-Object -ExpandProperty value) }
     }
-    $NmeAppInsights = Get-AzApplicationInsights -ResourceGroupName $NmeRg | Where-Object { $_.InstrumentationKey -eq ($NmeWebApp.siteconfig.appsettings | Where-Object  {$_.name -eq 'ApplicationInsights:InstrumentationKey'} | Select-Object -ExpandProperty value) }
     if ($NmeAppInsights.count -ne 1) {
-        # bug in some Az.ApplicationInsights versions
-        throw "Unable to find NME App Insights. Az.ApplicationInsights module may need to be updated to greater than v2.0.0 in the NME scripted action automation account."
+        throw "Unable to find NME App Insights. Please add the tag '$NmeResourceTagName' with value 'NERDIO_MANAGER_APPINSIGHTS' to the Nerdio Manager Application Insights resource and rerun this script."
     }
     #$script:NmeAppInsightsLAWName = ($NmeAppInsights.WorkspaceResourceId).Split("/")[-1]
     $script:NmeAppInsightsName = $NmeAppInsights.name
@@ -177,24 +221,75 @@ function Set-NmeVars {
     $script:NmeAutomationAccountName = ($NmeWebApp.siteconfig.appsettings | Where-Object name -eq 'Deployment:AutomationAccountName').value
     $script:NmeScriptedActionsAccountName = (($NmeWebApp.siteconfig.appsettings | Where-Object name -eq 'Deployment:ScriptedActionAccount').value).Split("/")[-1]
     $script:NmeRegion = $NmeKeyVault.Location
-    Write-Verbose "Getting Nerdio Manager sql server"
-    if ($key){
-        $SqlServer = Get-AzSqlServer -ResourceGroupName $nmerg | ? ServerName -NotMatch '-secondary' | Where-Object {$_.tags[$key] -ne 'INTUNE_INSIGHTS_DEPLOYMENT_RESOURCE' -and $_.tags[$key] -ne 'EIDO_DEPLOYMENT_RESOURCE'}
+
+    # Find Real Time Insights components if they exist
+    # Find RTI sql server
+    try {$RtiSqlServer = Get-AzSqlServer -ResourceGroupName $nmerg | Where-Object {$_.tags[$NmeResourceTagName] -eq 'REAL_TIME_INSIGHTS_SQL_SERVER'}} 
+    catch{}
+    # if not found, try previous method
+    if (!$RtiSqlServer) {
+        if ($key){
+            $RtiSqlServer = Get-AzSqlServer -ResourceGroupName $nmerg | Where-Object { $_.Tags.Keys -contains $key } | Where-Object {$_.tags[$key] -eq 'REAL_TIME_INSIGHTS_DEPLOYMENT_RESOURCE'}
+        }
+        else {
+            $RtiSqlServer = Get-AzSqlServer -ResourceGroupName $nmerg
+        }
     }
-    else {
-        $SqlServer = Get-AzSqlServer -ResourceGroupName $nmerg | ? ServerName -NotMatch '-secondary'
+    if ($RtiSqlServer) {
+        Write-Verbose "Found Real Time Insights sql server"
+        $script:NmeRtiSqlServerName = $RtiSqlServer.ServerName
     }
-    if ($SqlServer.count -ne 1) {
-        Throw "Unable to find NME sql server"
+    # find RTI web app
+    try {
+        $RtiWebApp = Get-AzWebApp -ResourceGroupName $NmeRg | Where-Object {$_.tags[$NmeResourceTagName] -eq 'REAL_TIME_INSIGHTS_WEBAPP'}
+    } catch{}
+    # if not found, try previous method
+    if (!$RtiWebApp) {
+        if ($key){
+            $RtiWebApp = Get-AzWebApp -ResourceGroupName $NmeRg | Where-Object { $_.Tags.Keys -contains $key } | Where-Object {$_.tags[$key] -eq 'REAL_TIME_INSIGHTS_DEPLOYMENT_RESOURCE'}
+        }
+        else {
+            $RtiWebApp = Get-AzWebApp -ResourceGroupName $NmeRg
+        }
     }
-    else {
-        $script:NmeSqlServerName = $SqlServer.ServerName
+    if ($RtiWebApp) {
+        Write-Verbose "Found Real Time Insights web app"
+        $script:NmeRtiWebAppName = $RtiWebApp.Name
     }
-    $SqlSecondary = Get-AzSqlServer -ResourceGroupName $nmerg | ? ServerName -Match '-secondary'
-    if ($SqlSecondary) {
-        $script:NmeSqlSecondaryServerName = $SqlSecondary.ServerName
+    # find RTI key vault
+    try {
+        $RtiKeyVault = Get-AzKeyVault -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object {$_.tags[$NmeResourceTagName] -eq 'REAL_TIME_INSIGHTS_KEYVAULT'}
+    } catch{}
+    # if not found, try previous method
+    if (!$RtiKeyVault) {
+        if ($key){
+            $RtiKeyVault = Get-AzKeyVault -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object { $_.Tags.Keys -contains $key } | Where-Object {$_.tags[$key] -eq 'REAL_TIME_INSIGHTS_DEPLOYMENT_RESOURCE'}
+        }
+        else {
+            $RtiKeyVault = Get-AzKeyVault -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue
+        }
     }
-    $script:NmeSqlDbName = (Get-AzSqlDatabase -ResourceGroupName $nmerg -ServerName $nmesqlserverName | Where-Object DatabaseName -ne 'master').DatabaseName
+    if ($RtiKeyVault) {
+        Write-Verbose "Found Real Time Insights key vault"
+        $script:NmeRtiKeyVaultName = $RtiKeyVault.VaultName
+    }
+    # find RTI storage account
+    try {
+        $RtiStorageAccount = Get-AzStorageAccount -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object {$_.tags[$NmeResourceTagName] -eq 'REAL_TIME_INSIGHTS_STORAGE_ACCOUNT'}
+    } catch{}
+    # if not found, try previous method
+    if (!$RtiStorageAccount) {
+        if ($key){
+            $RtiStorageAccount = Get-AzStorageAccount -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object { $_.Tags.Keys -contains $key } | Where-Object {$_.tags[$key] -eq 'REAL_TIME_INSIGHTS_DEPLOYMENT_RESOURCE'}
+        }
+        else {
+            $RtiStorageAccount = Get-AzStorageAccount -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue
+        }
+    }
+    if ($RtiStorageAccount) {
+        Write-Verbose "Found Real Time Insights storage account"
+        $script:NmeRtiStorageAccountName = $RtiStorageAccount.StorageAccountName
+    }
 }
 
 Set-NmeVars -keyvaultName $KeyVaultName
@@ -217,6 +312,10 @@ $DpsStoragePrivateEndpointName = "$Prefix-dps-storage-privateendpoint"
 $IiKvPrivateEndpointName = "$Prefix-ii-kv-privateendpoint"
 $IiAppServicePrivateEndpointName = "$Prefix-ii-appservice-privateendpoint"
 $IiSqlPrivateEndpointName = "$Prefix-ii-sql-privateendpoint"
+$RtiKvPrivateEndpointName = "$Prefix-rti-kv-privateendpoint"
+$RtiSqlPrivateEndpointName = "$Prefix-rti-sql-privateendpoint"
+$RtiAppServicePrivateEndpointName = "$Prefix-rti-appservice-privateendpoint"
+$RtiStoragePrivateEndpointName = "$Prefix-rti-storage-privateendpoint"
 
 # define variables for DNS zone group names 
 $KvDnsZoneGroupName = "$Prefix-app-kv-dnszonegroup"
@@ -228,10 +327,16 @@ $MonitorPrivateDnsZoneGroupName = "$Prefix-app-monitor-dnszonegroup"
 $AppServicePrivateDnsZoneGroupName = "$Prefix-app-appservice-dnszonegroup"
 $CclKvDnsZoneGroupName = "$Prefix-ccl-kv-dnszonegroup"
 $CclStoragePrivateDnsZoneGroupName = "$Prefix-ccl-storage-dnszonegroup"
+$CclAppServiceDnsZoneGroupName = "$Prefix-ccl-appservice-dnszonegroup"
 $DpsStoragePrivateDnsZoneGroupName = "$Prefix-dps-storage-dnszonegroup"
 $IiKvDnsZoneGroupName = "$Prefix-ii-kv-dnszonegroup"
 $IiSqlDnsZoneGroupName = "$Prefix-ii-sql-dnszonegroup"
 $IiAppServiceDnsZoneGroupName = "$Prefix-ii-appservice-dnszonegroup"
+$RtiKvDnsZoneGroupName = "$Prefix-rti-kv-dnszonegroup"
+$RtiSqlDnsZoneGroupName = "$Prefix-rti-sql-dnszonegroup"
+$RtiAppServiceDnsZoneGroupName = "$Prefix-rti-appservice-dnszonegroup"
+$RtiStorageDnsZoneGroupName = "$Prefix-rti-storage-dnszonegroup"
+
 
 # define variables for private link service connection names
 $KvServiceConnectionName = "$Prefix-app-kv-serviceconnection"
@@ -248,11 +353,16 @@ $DpsStorageServiceConnectionName = "$Prefix-dps-storage-serviceconnection"
 $IiKvServiceConnectionName = "$Prefix-ii-kv-serviceconnection"
 $IiAppServiceServiceConnectionName = "$Prefix-ii-appservice-serviceconnection"
 $IiSqlServiceConnectionName = "$Prefix-ii-sql-serviceconnection"
+$RtiKvServiceConnectionName = "$Prefix-rti-kv-serviceconnection"
+$RtiSqlServiceConnectionName = "$Prefix-rti-sql-serviceconnection"
+$RtiAppServiceServiceConnectionName = "$Prefix-rti-appservice-serviceconnection"
+$RtiStorageServiceConnectionName = "$Prefix-rti-storage-serviceconnection"
 
 # web app subnet delegation
 $WebAppSubnetDelegationName = "$Prefix-app-webapp-subnetdelegation"
 
 # define Azure monitor private link service settings
+$MakeAzureMonitorPrivate = $false
 $IngestionAccessMode = 'Open'
 $QueryAccessMode = 'Open'
 
@@ -336,7 +446,7 @@ if ($PeerVnetIds -eq 'All') {
     $VnetIds = Get-AzVirtualNetwork | ? {if ($_.tag){$True}}| Where-Object {$_.tag["$Prefix`_OBJECT_TYPE"] -eq 'LINKED_NETWORK'} -ErrorAction SilentlyContinue | Where-Object id -ne $vnet.id | Select-Object -ExpandProperty Id
 }
 else {
-    $VnetIds = $PeerVnetIds -split ','
+    $VnetIds = if ($PeerVnetIds) { $PeerVnetIds -split ',' } else { @() }
 }
 # set resource group for dns zones
 if ($SkipDNS -eq 'True') {
@@ -352,6 +462,7 @@ if ($SkipDNS -eq 'True') {
     $OdsDnsZone = $null
     $MonitorAgentDnsZone = $null
     $AppServiceDnsZone = $null
+    $ExistingDNSZonesRG = $null
 }
 elseif ($ExistingDNSZonesRG) {
     $DnsRg = $ExistingDNSZonesRG
@@ -436,7 +547,9 @@ if ($VNet) {
         $vnetUpdated = $true
     }
  
-    If ($vnetUpdated){$VNet | Set-AzVirtualNetwork}
+    If ($vnetUpdated){
+        $VNet | Set-AzVirtualNetwork
+    }
  
 } else {
     Write-Output "Creating VNet and subnets"
@@ -997,7 +1110,7 @@ if ($NmeCclWebAppName) {
         } else {
             Write-Output "Configuring CCL app service DNS zone group"
             $Config = New-AzPrivateDnsZoneConfig -Name $AppServiceDnsZoneName -PrivateDnsZoneId $AppServiceDnsZone.ResourceId
-            $CclAppServiceDnsZoneGroup = New-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName "$CclAppServicePrivateEndpointName" -Name $AppServicePrivateDnsZoneGroupName -PrivateDnsZoneConfig $config
+            $CclAppServiceDnsZoneGroup = New-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName "$CclAppServicePrivateEndpointName" -Name $CclStoragePrivateDnsZoneGroupName -PrivateDnsZoneConfig $config
         }
     } else {
         Write-Output "Skipping CCL App Service DNS zone group configuration (SkipDNS enabled)"
@@ -1038,6 +1151,118 @@ if ($NmeIiWebAppName) {
     $IiWebAppResource = Get-AzResource -Id $IiWebApp.id
     $IiWebAppResource.Properties.publicNetworkAccess = "Disabled"
     $IiWebAppResource | Set-AzResource -Force | Out-Null
+}
+
+# add private endpoints for real time insights app service
+if ($NmeRtiWebAppName) {
+    $RtiWebApp = Get-AzWebApp -ResourceGroupName $NmeRg -Name $NmeRtiWebAppName
+    # check if rti app service private endpoint is created
+    $RtiAppServicePrivateEndpoint = $ExistingPrivateEndpoints | Where-Object { $_.PrivateLinkServiceConnections.PrivateLinkServiceId -eq $RtiWebApp.id }
+    if ($RtiAppServicePrivateEndpoint) {
+        Write-Output "Found RTI App Service private endpoint"
+    } 
+    else {
+        Write-Output "Configuring RTI app service service connection and private endpoint"
+        $RtiAppServiceResourceId = $RtiWebApp.id
+        $RtiAppServiceServiceConnection = New-AzPrivateLinkServiceConnection -Name $RtiAppServiceServiceConnectionName -PrivateLinkServiceId $RtiAppServiceResourceId -GroupId sites 
+        $RtiAppServicePrivateEndpoint = New-AzPrivateEndpoint -Name "$RtiAppServicePrivateEndpointName" -ResourceGroupName $NmeRg -Location $NmeRegion -Subnet $PrivateEndpointSubnet -PrivateLinkServiceConnection $RtiAppServiceServiceConnection 
+    }
+    # check if rti app service dns zone group created
+    if ($SkipDNS -ne 'True') {
+        $RtiAppServiceDnsZoneGroup = Get-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName $RtiAppServicePrivateEndpoint.Name -ErrorAction SilentlyContinue
+        if ($RtiAppServiceDnsZoneGroup) {
+            Write-Output "Found RTI App Service DNS zone group"
+        } else {
+            Write-Output "Configuring RTI app service DNS zone group"
+            $Config = New-AzPrivateDnsZoneConfig -Name $AppServiceDnsZoneName -PrivateDnsZoneId $AppServiceDnsZone.ResourceId
+            $RtiAppServiceDnsZoneGroup = New-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName "$RtiAppServicePrivateEndpointName" -Name $RtiAppServiceDnsZoneGroupName -PrivateDnsZoneConfig $config
+        }
+    } else {
+        Write-Output "Skipping RTI App Service DNS zone group configuration (SkipDNS enabled)"
+    }
+}
+# add private endpoints for real time insights sql server
+if ($NmeRtiSqlServerName) {
+    $RtiSqlServer = Get-AzSqlServer -ResourceGroupName $NmeRg -ServerName $NmeRtiSqlServerName
+    # check if rti sql private endpoint is created
+    $RtiSqlPrivateEndpoint = $ExistingPrivateEndpoints | Where-Object { $_.PrivateLinkServiceConnections.PrivateLinkServiceId -eq $RtiSqlServer.ResourceId }
+    if ($RtiSqlPrivateEndpoint) {
+        Write-Output "Found RTI SQL private endpoint"
+    } 
+    else {
+        Write-Output "Configuring RTI sql service connection and private endpoint"
+        $RtiSqlServiceConnection = New-AzPrivateLinkServiceConnection -Name $RtiSqlServiceConnectionName -PrivateLinkServiceId $RtiSqlServer.ResourceId -GroupId sqlserver 
+        $RtiSqlPrivateEndpoint = New-AzPrivateEndpoint -Name "$RtiSqlPrivateEndpointName" -ResourceGroupName $NmeRg -Location $NmeRegion -Subnet $PrivateEndpointSubnet -PrivateLinkServiceConnection $RtiSqlServiceConnection 
+    }
+    # check if rti sql dns zone group created
+    if ($SkipDNS -ne 'True') {
+        $RtiSqlDnsZoneGroup = Get-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName $RtiSqlPrivateEndpoint.Name -ErrorAction SilentlyContinue
+        if ($RtiSqlDnsZoneGroup) {
+            Write-Output "Found RTI SQL DNS zone group"
+        } else {
+            Write-Output "Configuring RTI sql DNS zone group"
+            $Config = New-AzPrivateDnsZoneConfig -Name $SqlDnsZoneName -PrivateDnsZoneId $SqlDnsZone.ResourceId
+            $RtiSqlDnsZoneGroup = New-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName "$RtiSqlPrivateEndpointName" -Name $RtiSqlDnsZoneGroupName -PrivateDnsZoneConfig $config
+        }
+    } else {
+        Write-Output "Skipping RTI SQL DNS zone group configuration (SkipDNS enabled)"
+    }
+}
+# add private endpoint for real time insights storage account
+if ($NmeRtiStorageAccountName) {
+    # Get rti storage account
+    $NmeRtiStorageAccount = Get-AzStorageAccount -ResourceGroupName $NmeRg -Name $NmeRtiStorageAccountName
+    # check if rti storage account private endpoint is created
+    $RtiStoragePrivateEndpoint = $ExistingPrivateEndpoints | Where-Object { $_.PrivateLinkServiceConnections.PrivateLinkServiceId -eq $NmeRtiStorageAccount.Id }
+    if ($RtiStoragePrivateEndpoint) {
+        Write-Output "Found RTI storage private endpoint"
+    } 
+    else {
+        Write-Output "Configuring RTI storage service connection and private endpoint"
+        $RtiStorageServiceConnection = New-AzPrivateLinkServiceConnection -Name $RtiStorageServiceConnectionName -PrivateLinkServiceId $NmeRtiStorageAccount.Id -GroupId blob 
+        $RtiStoragePrivateEndpoint = New-AzPrivateEndpoint -Name "$RtiStoragePrivateEndpointName" -ResourceGroupName $NmeRg -Location $NmeRegion -Subnet $PrivateEndpointSubnet -PrivateLinkServiceConnection $RtiStorageServiceConnection 
+    }
+    # check if rti storage account dns zone group created
+    if ($SkipDNS -ne 'True') {
+        $RtiStorageDnsZoneGroup = Get-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName $RtiStoragePrivateEndpoint.Name -ErrorAction SilentlyContinue
+        if ($RtiStorageDnsZoneGroup) {
+            Write-Output "Found RTI storage DNS zone group"
+        } else {
+            Write-Output "Configuring RTI storage DNS zone group"
+            $Config = New-AzPrivateDnsZoneConfig -Name $StorageDnsZoneName -PrivateDnsZoneId $StorageDnsZone.ResourceId
+            $RtiStorageDnsZoneGroup = New-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName "$RtiStoragePrivateEndpointName" -Name $RtiStorageDnsZoneGroupName -PrivateDnsZoneConfig $config
+        }
+    } else {
+        Write-Output "Skipping RTI storage DNS zone group configuration (SkipDNS enabled)"
+    }
+}
+# add private endpoint for real time insights key vault
+if ($NmeRtiKeyVaultName) {
+    # Get rti key vault
+    $NmeRtiKeyVault = Get-AzKeyVault -ResourceGroupName $NmeRg -VaultName $NmeRtiKeyVaultName
+    # check if rti key vault private endpoint is created
+    $RtiKvPrivateEndpoint = $ExistingPrivateEndpoints | Where-Object { $_.PrivateLinkServiceConnections.PrivateLinkServiceId -eq $NmeRtiKeyVault.Id }
+    if ($RtiKvPrivateEndpoint) {
+        Write-Output "Found RTI Key Vault private endpoint"
+    } 
+    else {
+        Write-Output "Configuring RTI Key Vault service connection and private endpoint"
+        $RtiKvServiceConnection = New-AzPrivateLinkServiceConnection -Name $RtiKvServiceConnectionName -PrivateLinkServiceId $NmeRtiKeyVault.Id -GroupId vault 
+        $RtiKvPrivateEndpoint = New-AzPrivateEndpoint -Name "$RtiKvPrivateEndpointName" -ResourceGroupName $NmeRg -Location $NmeRegion -Subnet $PrivateEndpointSubnet -PrivateLinkServiceConnection $RtiKvServiceConnection 
+    }
+    # check if rti key vault dns zone group created
+    if ($SkipDNS -ne 'True') {
+        $RtiKvDnsZoneGroup = Get-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName $RtiKvPrivateEndpoint.Name -ErrorAction SilentlyContinue
+        if ($RtiKvDnsZoneGroup) {
+            Write-Output "Found RTI Key Vault DNS zone group"
+        } else {
+            Write-Output "Configuring RTI Key Vault DNS zone group"
+            $Config = New-AzPrivateDnsZoneConfig -Name $KeyVaultDnsZoneName  -PrivateDnsZoneId $KeyVaultDnsZone.ResourceId
+            $RtiKvDnsZoneGroup = New-AzPrivateDnsZoneGroup -ResourceGroupName $NmeRg -PrivateEndpointName "$RtiKvPrivateEndpointName" -Name $RtiKvDnsZoneGroupName -PrivateDnsZoneConfig $Config
+        }
+    } else {
+        Write-Output "Skipping RTI Key Vault DNS zone group configuration (SkipDNS enabled)"
+    }
 }
 
 #endregion
@@ -1253,14 +1478,14 @@ else {
 }
 
 $webApp = Get-AzResource -Id $NmeWebApp.id 
-# check if endpoint integration enabled
+# check if vnet integration enabled
 if ($webApp.Properties.virtualNetworkSubnetId -eq $AppServiceSubnet.id) {
     Write-Output "App service VNet integration already enabled"
 } 
 else {
     Write-Output "Enabling app service VNet integration"
     $webApp.Properties.virtualNetworkSubnetId = $AppServiceSubnet.id
-    $webApp.Properties.vnetRouteAllEnabled = 'true'
+    $webApp.Properties.vnetRouteAllEnabled = 'false'
     $webApp.Properties.publicNetworkAccess = "Enabled"
     $WebApp = $webApp | Set-AzResource -Force
 }
@@ -1275,7 +1500,7 @@ if ($NmeCclWebAppName) {
     else {
         Write-Output "Enabling CCL app service VNet integration"
         $CclWebApp.Properties.virtualNetworkSubnetId = $AppServiceSubnet.id
-        $CclWebApp.Properties.vnetRouteAllEnabled = 'true'
+        $CclWebApp.Properties.vnetRouteAllEnabled = 'false'
         $CclWebApp = $CclWebApp | Set-AzResource -Force
     }
 }
@@ -1291,8 +1516,23 @@ if ($NmeIiWebAppName) {
     else {
         Write-Output "Enabling Intune Insights app service VNet integration"
         $IiwWebApp.Properties.virtualNetworkSubnetId = $AppServiceSubnet.id
-        $IiwWebApp.Properties.vnetRouteAllEnabled = 'true'
+        $IiwWebApp.Properties.vnetRouteAllEnabled = 'false'
         $IiwWebApp = $IiwWebApp | Set-AzResource -Force
+    }
+}
+# check if real time insights web app exists
+if ($NmeRtiWebAppName) {
+    $NmeRtiWebApp = Get-AzWebApp -ResourceGroupName $NmeRg -Name $NmeRtiWebAppName
+    $RtiWebApp = Get-AzResource -Id $NmeRtiWebApp.id 
+    # check if endpoint integration enabled
+    if ($RtiWebApp.Properties.virtualNetworkSubnetId -eq $AppServiceSubnet.id) {
+        Write-Output "RTI App service VNet integration already enabled"
+    } 
+    else {
+        Write-Output "Enabling RTI app service VNet integration"
+        $RtiWebApp.Properties.virtualNetworkSubnetId = $AppServiceSubnet.id
+        $RtiWebApp.Properties.vnetRouteAllEnabled = 'false'
+        $RtiWebApp = $RtiWebApp | Set-AzResource -Force
     }
 }
 # enable network policy
@@ -1308,7 +1548,7 @@ if ($AppServiceSubnet.PrivateEndpointNetworkPolicies -eq 'Enabled') {
 }
 #endregion
 
-# region make resources private
+#region make resources private
 
 Write-Output "Check network deny rules for key vault and sql"
 $NmeKeyVault = Get-AzKeyVault -ResourceGroupName $NmeRg -VaultName $KeyVaultName
@@ -1379,6 +1619,7 @@ if ($NmeCclStorageAccountName) {
     }
 }
 
+
 # make dps storage account private
 if ($NmeDpsStorageAccountName) {
     $NmeDpsStorageAccount = Get-AzStorageAccount -ResourceGroupName $NmeRg -Name $NmeDpsStorageAccountName
@@ -1390,9 +1631,101 @@ if ($NmeDpsStorageAccountName) {
         Set-AzStorageAccount -PublicNetworkAccess Disabled -ResourceGroupName $NmeRg -Name $NmeDpsStorageAccount.StorageAccountName | Out-Null
     }
 }
+# make real time insights resources private
+if ($NmeRtiStorageAccountName) {
+    $NmeRtiStorageAccount = Get-AzStorageAccount -ResourceGroupName $NmeRg -Name $NmeRtiStorageAccountName
+    if ($NmeRtiStorageAccount.PublicNetworkAccess -eq 'Disabled') {
+        Write-Output "RTI Storage public access is already disabled"
+    }
+    else {
+        Write-Output "Disabling RTI storage public access"
+        Set-AzStorageAccount -PublicNetworkAccess Disabled -ResourceGroupName $NmeRg -Name $NmeRtiStorageAccount.StorageAccountName | Out-Null
+    }
+}
+if ($NmeRtiSqlServerName) {
+    $RtiSqlServer = Get-AzSqlServer -ResourceGroupName $NmeRg -ServerName $NmeRtiSqlServerName
+    $RtiServerRules = Get-AzSqlServerVirtualNetworkRule -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg 
+    if ($RtiSqlServer.PublicNetworkAccess -eq 'Disabled') {
+        Write-Output "RTI SQL public access already disabled"
+    }
+    else {
+        Write-Output "Disabling RTI SQL public access"
+        if ($RtiServerRules.VirtualNetworkSubnetId -notcontains $PrivateEndpointSubnet.id){
+            $PrivateEndpointRule = New-AzSqlServerVirtualNetworkRule -VirtualNetworkRuleName 'Allow private endpoint subnet' -VirtualNetworkSubnetId $PrivateEndpointSubnet.id -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg
+        }
+        # New-AzSqlServerVirtualNetworkRule -VirtualNetworkRuleName 'Allow app service subnet' -VirtualNetworkSubnetId $AppServiceSubnet.id -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg
+        if ($RtiSqlServer.PublicNetworkAccess -eq 'Enabled'){
+            $DenyPublicSql = Set-AzSqlServer -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess "Disabled"
+        }
+    }
+}
+if ($NmeRtiKeyVaultName) {
+    $RtiKeyVault = Get-AzKeyVault -ResourceGroupName $NmeRg -VaultName $NmeRtiKeyVaultName
+    # check if deny rule for key vault exists
+    if (($RtiKeyVault.NetworkAcls.DefaultAction -eq 'Deny') -and ($RtiKeyVault.PublicNetworkAccess -eq 'Disabled')) {
+        Write-Output "RTI Key vault public access already disabled"
+    }
+    else {
+        Write-Output "Disabling RTI key vault public access"
+        Add-AzKeyVaultNetworkRule -VaultName $RtiKeyVault.VaultName -VirtualNetworkResourceId $PrivateEndpointSubnet.id -ResourceGroupName $NmeRg 
+        Update-AzKeyVaultNetworkRuleSet -VaultName $RtiKeyVault.VaultName -Bypass None -ResourceGroupName $NmeRg
+        update-AzKeyVaultNetworkRuleSet -VaultName $RtiKeyVault.VaultName -DefaultAction Deny -ResourceGroupName $NmeRg
+        Update-AzKeyVault -ResourceGroupName $NmeRg -VaultName $RtiKeyVault.VaultName -PublicNetworkAccess 'Disabled' | out-null
+    }
+}
+
+# make intune insights key vault private
+if ($NmeIiKeyVaultName) {
+    $IiKeyVault = Get-AzKeyVault -ResourceGroupName $NmeRg -VaultName $NmeIiKeyVaultName
+    # check if deny rule for key vault exists
+    if (($IiKeyVault.NetworkAcls.DefaultAction -eq 'Deny') -and ($IiKeyVault.PublicNetworkAccess -eq 'Disabled')) {
+        Write-Output "Intune Insights Key vault public access already disabled"
+    }
+    else {
+        Write-Output "Disabling Intune Insights key vault public access"
+        Add-AzKeyVaultNetworkRule -VaultName $IiKeyVault.VaultName -VirtualNetworkResourceId $PrivateEndpointSubnet.id -ResourceGroupName $NmeRg 
+        Update-AzKeyVaultNetworkRuleSet -VaultName $IiKeyVault.VaultName -Bypass None -ResourceGroupName $NmeRg
+        update-AzKeyVaultNetworkRuleSet -VaultName $IiKeyVault.VaultName -DefaultAction Deny -ResourceGroupName $NmeRg
+        Update-AzKeyVault -ResourceGroupName $NmeRg -VaultName $IiKeyVault.VaultName -PublicNetworkAccess 'Disabled' | out-null
+    }
+}
+# make intune insights sql server private
+if ($NmeIiSqlServerName) {
+    $IiSqlServer = Get-AzSqlServer -ResourceGroupName $NmeRg -ServerName $NmeIiSqlServerName
+    $IiServerRules = Get-AzSqlServerVirtualNetworkRule -ServerName $NmeIiSqlServerName -ResourceGroupName $NmeRg 
+    if ($IiSqlServer.PublicNetworkAccess -eq 'Disabled') {
+        Write-Output "Intune Insights SQL public access already disabled"
+    }
+    else {
+        Write-Output "Disabling Intune Insights SQL public access"
+        if ($IiServerRules.VirtualNetworkSubnetId -notcontains $PrivateEndpointSubnet.id){
+            $PrivateEndpointRule = New-AzSqlServerVirtualNetworkRule -VirtualNetworkRuleName 'Allow private endpoint subnet' -VirtualNetworkSubnetId $PrivateEndpointSubnet.id -ServerName $NmeIiSqlServerName -ResourceGroupName $NmeRg
+        }
+        # New-AzSqlServerVirtualNetworkRule -VirtualNetworkRuleName 'Allow app service subnet' -VirtualNetworkSubnetId $AppServiceSubnet.id -ServerName $NmeIiSqlServerName -ResourceGroupName $NmeRg
+        if ($IiSqlServer.PublicNetworkAccess -eq 'Enabled'){
+            $DenyPublicSql = Set-AzSqlServer -ServerName $NmeIiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess "Disabled"
+        }
+    }
+}
+# make intune insights app service private
+if ($NmeIiAppServiceName) {
+    $NmeIiAppService = Get-AzWebApp -ResourceGroupName $NmeRg -Name $NmeIiAppServiceName
+    $IiAppService = Get-AzResource -Id $NmeIiAppService.id 
+    if ($IiAppService.Properties.publicNetworkAccess -eq 'Disabled') {
+        Write-Output "Intune Insights app service public access already disabled"
+    }
+    else {
+        Write-Output "Disabling Intune Insights app service public access"
+        $IiAppService.Properties.publicNetworkAccess = "Disabled"
+        $IiAppService | Set-AzResource -Force | Out-Null
+    }
+}
+
+#endregion
 
 $webApp = Get-AzResource -Id $NmeWebApp.id 
 if ($MakeAppServicePrivate -eq 'True') {
+    Write-Output "Disabling NME app service public access"
     $webApp.Properties.publicNetworkAccess = "Disabled"
     $webApp | Set-AzResource -Force | Out-Null
 }
