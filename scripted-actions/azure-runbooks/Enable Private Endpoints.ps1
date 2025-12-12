@@ -1657,7 +1657,12 @@ if ($NmeRtiSqlServerName) {
         }
         # New-AzSqlServerVirtualNetworkRule -VirtualNetworkRuleName 'Allow app service subnet' -VirtualNetworkSubnetId $AppServiceSubnet.id -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg
         if ($RtiSqlServer.PublicNetworkAccess -eq 'Enabled'){
-            $DenyPublicSql = Set-AzSqlServer -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess "Disabled"
+            try {$DenyPublicSql = Set-AzSqlServer -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess Disabled}
+            catch {
+                # sometimes can't disable public network access in gov cloud
+                Write-Output "Disabling RTI SQL public network access failed. Disable in Azure Portal"
+                Write-Warning "Disabling RTI SQL public network access failed. Disable in Azure Portal"
+            }
         }
     }
 }
