@@ -190,7 +190,11 @@ function Set-NmeVars {
     # try get nme web app by tag using nmeresourcetagname
     $script:NmeWebApp = Get-AzWebApp -ResourceGroupName $NmeRg | Where-Object {$_.tags[$NmeResourceTagName] -eq 'NERDIO_MANAGER_WEBAPP'}
     if (!$NmeWebApp) {
-        Write-Verbose "NME web app not found by tag, trying by key"
+        # get web app with tag 
+        $script:NmeWebApp = Get-AzWebApp -ResourceGroupName $NmeRg | Where-Object { $_.Tags.Keys -contains $key } | Where-Object {$_.tags[$key] -eq 'PAAS'}
+    }
+    if (!$NmeWebApp) {
+        Write-Verbose "NME web app not found by tag, trying by app settings"
             $webapps = Get-AzWebApp -ResourceGroupName $NmeRg 
         if ($webapps){
             $script:NmeWebApp = $webapps | Where-Object { ($_.siteconfig.appsettings | where-object name -eq "Deployment:KeyVaultName" | Select-Object -ExpandProperty value) -eq $keyvaultName }
@@ -198,6 +202,9 @@ function Set-NmeVars {
         else {
             throw "Unable to find Nerdio Manager web app. Please add the tag '$NmeResourceTagName' with value 'NERDIO_MANAGER_WEBAPP' to the Nerdio Manager web app and rerun this script."
         }
+    }
+    if ($NmeWebApp.count -ne 1) {
+        throw "Unable to find Nerdio Manager web app. Please add the tag '$NmeResourceTagName' with value 'NERDIO_MANAGER_WEBAPP' to the Nerdio Manager web app and rerun this script."
     }
 
     write-verbose "Getting Nerdio Manager Application Insights"
@@ -441,6 +448,17 @@ Function Check-LastRunResults {
 }
     
 Check-LastRunResults
+
+# Check if nme app service is already vnet integrated
+if ($NmeWebApp.virtualNetworkSubnetId){
+    Write-Output "NME App service VNet integration already enabled. Confirming subnet matches current parameters"
+    if (($NmeWebApp.virtualNetworkSubnetId -notmatch $AppServiceSubnetName) -or ($NmeWebApp.virtualNetworkSubnetId -notmatch $PrivateLinkVnetName)) {
+        Write-output "NME App service is already VNet integrated, but the subnet does not match the specified PrivateLinkVnetName or AppServiceSubnetName parameters provided."
+        write-error "NME App service is already VNet integrated, but the subnet does not match the specified PrivateLinkVnetName or AppServiceSubnetName parameters provided." 
+        throw "NME App service is already VNet integrated, but the subnet does not match the specified PrivateLinkVnetName or AppServiceSubnetName parameters provided."
+    } 
+}
+
 
 if ($PeerVnetIds -eq 'All') {
     $VnetIds = Get-AzVirtualNetwork | ? {if ($_.tag){$True}}| Where-Object {$_.tag["$Prefix`_OBJECT_TYPE"] -eq 'LINKED_NETWORK'} -ErrorAction SilentlyContinue | Where-Object id -ne $vnet.id | Select-Object -ExpandProperty Id
