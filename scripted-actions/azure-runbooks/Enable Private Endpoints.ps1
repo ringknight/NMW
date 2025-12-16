@@ -1149,10 +1149,7 @@ if ($NmeIiWebAppName) {
     } else {
         Write-Output "Skipping Intune Insights App Service DNS zone group configuration (SkipDNS enabled)"
     }
-    # disable public network access for Intune Insights web app
-    $IiWebAppResource = Get-AzResource -Id $IiWebApp.id
-    $IiWebAppResource.Properties.publicNetworkAccess = "Disabled"
-    $IiWebAppResource | Set-AzResource -Force | Out-Null
+
 }
 
 # add private endpoints for real time insights app service
@@ -1661,6 +1658,7 @@ if ($NmeRtiSqlServerName) {
             catch {
                 # sometimes can't disable public network access in gov cloud
                 Write-Output "Disabling RTI SQL public network access failed. Disable in Azure Portal"
+                write-output $_
                 Write-Warning "Disabling RTI SQL public network access failed. Disable in Azure Portal"
             }
         }
@@ -1710,23 +1708,19 @@ if ($NmeIiSqlServerName) {
         }
         # New-AzSqlServerVirtualNetworkRule -VirtualNetworkRuleName 'Allow app service subnet' -VirtualNetworkSubnetId $AppServiceSubnet.id -ServerName $NmeIiSqlServerName -ResourceGroupName $NmeRg
         if ($IiSqlServer.PublicNetworkAccess -eq 'Enabled'){
-            $DenyPublicSql = Set-AzSqlServer -ServerName $NmeIiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess "Disabled"
+            try {
+                $DenyPublicSql = Set-AzSqlServer -ServerName $NmeIiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess "Disabled"
+            }
+            catch {
+                # sometimes can't disable public network access in gov cloud
+                Write-Output "Disabling Intune Insights SQL public network access failed. Disable in Azure Portal"
+                write-output $_
+                Write-Warning "Disabling Intune Insights SQL public network access failed. Disable in Azure Portal"
+            }
         }
     }
 }
-# make intune insights app service private
-if ($NmeIiAppServiceName) {
-    $NmeIiAppService = Get-AzWebApp -ResourceGroupName $NmeRg -Name $NmeIiAppServiceName
-    $IiAppService = Get-AzResource -Id $NmeIiAppService.id 
-    if ($IiAppService.Properties.publicNetworkAccess -eq 'Disabled') {
-        Write-Output "Intune Insights app service public access already disabled"
-    }
-    else {
-        Write-Output "Disabling Intune Insights app service public access"
-        $IiAppService.Properties.publicNetworkAccess = "Disabled"
-        $IiAppService | Set-AzResource -Force | Out-Null
-    }
-}
+
 
 #endregion
 
