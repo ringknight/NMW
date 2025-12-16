@@ -210,7 +210,7 @@ function Set-NmeVars {
     write-verbose "Getting Nerdio Manager Application Insights"
     # try get nme app insights by tag using nmeresourcetagname
     try {
-        $NmeAppInsights = Get-AzApplicationInsights -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object {$_.tags[$NmeResourceTagName] -eq 'NERDIO_MANAGER_APPINSIGHTS' }
+        $NmeAppInsights = Get-AzApplicationInsights -ResourceGroupName $NmeRg -ErrorAction SilentlyContinue | Where-Object {$_.tag[$NmeResourceTagName] -eq 'NERDIO_MANAGER_APPINSIGHTS' }
     } catch{}
     if (!$NmeAppInsights) {
         Write-Verbose "NME App Insights not found by tag, trying by instrumentation key"
@@ -524,6 +524,20 @@ else {
     $OdsDnsZone = Get-AzPrivateDnsZone -ResourceGroupName $DnsRg -Name $OdsDnsZoneName -ErrorAction SilentlyContinue
     $MonitorAgentDnsZone = Get-AzPrivateDnsZone -ResourceGroupName $DnsRg -Name $MonitorAgentDnsZoneName -ErrorAction SilentlyContinue
     $AppServiceDnsZone = Get-AzPrivateDnsZone -ResourceGroupName $DnsRg -Name $AppServiceDnsZoneName -ErrorAction SilentlyContinue
+}
+
+#### helper functions ####
+function GetEntAppName {
+    # check if mggraph module installed
+    if (!(Get-Module -ListAvailable -Name Microsoft.Graph.Applications)) {
+        Write-Output "Installing Microsoft.Graph module to retrieve app name"
+        Install-Module -Name Microsoft.Graph -repository PSGallery -Force
+    }
+    $ctx = get-azcontext
+    $graph = Connect-MgGraph -tenantid $ctx.Tenant.Id -ClientId $ctx.account -CertificateThumbprint $ctx.account.CertificateThumbprint -nowelcom
+    $App = Get-MgApplicationbyAppId -AppId $ctx.account
+    disconnect-mggraph | out-null
+    return $App.DisplayName
 }
 
 #### main script ####
@@ -1669,12 +1683,29 @@ if ($NmeRtiSqlServerName) {
         }
         # New-AzSqlServerVirtualNetworkRule -VirtualNetworkRuleName 'Allow app service subnet' -VirtualNetworkSubnetId $AppServiceSubnet.id -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg
         if ($RtiSqlServer.PublicNetworkAccess -eq 'Enabled'){
-            try {$DenyPublicSql = Set-AzSqlServer -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess Disabled}
+
+            try {
+                $DenyPublicSql = Set-AzSqlServer -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess Disabled
+            }
             catch {
-                # sometimes can't disable public network access in gov cloud
-                Write-Output "Disabling RTI SQL public network access failed. Disable in Azure Portal"
-                write-output $_
-                Write-Warning "Disabling RTI SQL public network access failed. Disable in Azure Portal"
+                try {
+                    if ($RtiSqlServer.Administrators.Sid.guid -eq $RtiSqlServer.Administrators.login) {
+                        # workaround for app id set as admin
+                        $AppName = GetEntAppName
+                        Set-AzSqlServerActiveDirectoryAdministrator -ResourceGroupName $NmeRg -ServerName $NmeRtiSqlServerName -DisplayName $AppName
+                        $DenyPublicSql = Set-AzSqlServer -ServerName $NmeRtiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess Disabled
+                    }
+                    else {
+                        Write-Output "Disabling RTI SQL public network access failed. Disable in Azure Portal"
+                        write-output $_
+                        Write-Warning "Disabling RTI SQL public network access failed. Disable in Azure Portal"
+                    }
+                }
+                catch {   
+                    Write-Output "Disabling RTI SQL public network access failed. Disable in Azure Portal"
+                    write-output $_
+                    Write-Warning "Disabling RTI SQL public network access failed. Disable in Azure Portal"
+                }
             }
         }
     }
@@ -1727,10 +1758,24 @@ if ($NmeIiSqlServerName) {
                 $DenyPublicSql = Set-AzSqlServer -ServerName $NmeIiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess "Disabled"
             }
             catch {
-                # sometimes can't disable public network access in gov cloud
-                Write-Output "Disabling Intune Insights SQL public network access failed. Disable in Azure Portal"
-                write-output $_
-                Write-Warning "Disabling Intune Insights SQL public network access failed. Disable in Azure Portal"
+                try {
+                    if ($IiSqlServer.Administrators.Sid.guid -eq $IiSqlServer.Administrators.login) {
+                        # workaround for app id set as admin
+                        $AppName = GetEntAppName
+                        Set-AzSqlServerActiveDirectoryAdministrator -ResourceGroupName $NmeRg -ServerName $NmeIiSqlServerName -DisplayName $AppName
+                        $DenyPublicSql = Set-AzSqlServer -ServerName $NmeIiSqlServerName -ResourceGroupName $NmeRg -PublicNetworkAccess Disabled
+                    }
+                    else {
+                        Write-Output "Disabling Intune Insights SQL public network access failed. Disable in Azure Portal"
+                        write-output $_
+                        Write-Warning "Disabling Intune Insights SQL public network access failed. Disable in Azure Portal"
+                    }
+                }
+                catch {   
+                    Write-Output "Disabling Intune Insights SQL public network access failed. Disable in Azure Portal"
+                    write-output $_
+                    Write-Warning "Disabling Intune Insights SQL public network access failed. Disable in Azure Portal"
+                }
             }
         }
     }
