@@ -238,9 +238,6 @@ function Set-NmeVars {
         if ($key){
             $RtiSqlServer = Get-AzSqlServer -ResourceGroupName $nmerg | Where-Object { $_.Tags.Keys -contains $key } | Where-Object {$_.tags[$key] -eq 'REAL_TIME_INSIGHTS_DEPLOYMENT_RESOURCE'}
         }
-        else {
-            $RtiSqlServer = Get-AzSqlServer -ResourceGroupName $nmerg
-        }
     }
     if ($RtiSqlServer) {
         Write-Verbose "Found Real Time Insights sql server"
