@@ -530,12 +530,12 @@ else {
 function GetEntAppName {
     # check if mggraph module installed
     if (!(Get-Module -ListAvailable -Name Microsoft.Graph.Applications)) {
-        Write-Output "Installing Microsoft.Graph module to retrieve app name"
-        Install-Module -Name Microsoft.Graph -repository PSGallery -Force
+        Write-Verbose "Installing Microsoft.Graph.Applications module to retrieve app name"
+        Install-Module -Name Microsoft.Graph.Applications -repository PSGallery -Force
     }
     $ctx = get-azcontext
-    $graph = Connect-MgGraph -tenantid $ctx.Tenant.Id -ClientId $ctx.account -CertificateThumbprint $ctx.account.CertificateThumbprint -nowelcom
-    $App = Get-MgApplicationbyAppId -AppId $ctx.account
+    $graph = Connect-MgGraph -tenantid $ctx.Tenant.Id -ClientId $ctx.account -CertificateThumbprint $ctx.account.CertificateThumbprint -nowelcome
+    $App = Get-MgApplicationbyAppId -AppId $ctx.account.Id
     disconnect-mggraph | out-null
     return $App.DisplayName
 }
