@@ -5,17 +5,19 @@
  
 This script will add private endpoints and service endpoints to allow the Nerdio Manager app service to communicate
 with the sql database, keyvault, and automation account over a private network, with no traffic routed over the public 
-internet. Access to the sql database and keyvault will be restricted to the private network. The 
-MakeAppServicePrivate parameter can be set to 'true' to further limit access to the app service to clients on the 
+internet. Access to the sql database and keyvault will be restricted to the private network. 
+
+If other NME components, such as Intune Insights, Cost Calculator, or Real Time Insights have been enabled, they will
+be added to the private network with private endpoints. The script can be re-run to add additional components to the
+private networking.
+
+The MakeAppServicePrivate parameter can be set to 'true' to further limit access to the app service to clients on the 
 private network or peered networks. Supplying ResourceIds for one ore more existing networks will cause those networks 
 to be peered to the new private network. 
 
-If the VNet and Subnets already exist, the existing resources will be used. If they do not exist, they will be 
-created. Names for resources created by this script, such as private endpoint names, can be customized by cloning
-this script and editing the variables at the top of the script.
-
-The user cost attribution resources (app service, LAW, key vault and app insights) will also be put on the private 
-network. 
+If the VNet and Subnets already exist, the existing resources will be used and address ranges will not be changed. 
+If they do not exist, they will be created. Names for resources created by this script, such as private endpoint names, 
+can be customized by cloning this script and editing the variables at the top of the script.
 
 If MakeSaStoragePrivate is True, the scripted actions storage account will be put on the private vnet. AVD VMs will need access to 
 the storage account to run scripted actions. Use the PeerVnetIds parameter to peer the AVD vnet to the private 
@@ -31,7 +33,7 @@ endpoint vnet.
     "DefaultValue": "nmw-private-vnet"
   },
   "VnetAddressRange": {
-    "Description": "Address range for private endpoint vnet. Not used if vnet already exists.",
+    "Description": "Address range for private endpoint vnet. Ignored if vnet already exists.",
     "IsRequired": false,
     "DefaultValue": "10.250.250.0/23"
   },
@@ -41,7 +43,7 @@ endpoint vnet.
     "DefaultValue": "nmw-privateendpoints-subnet"
   },
   "PrivateEndpointSubnetRange": {
-    "Description": "Address range for private endpoint subnet. Not used if subnet already exists.",
+    "Description": "Address range for private endpoint subnet. Ignored if subnet already exists.",
     "IsRequired": false,
     "DefaultValue": "10.250.250.0/24"
   },
@@ -51,7 +53,7 @@ endpoint vnet.
     "DefaultValue": "nmw-app-subnet"
   },
   "AppServiceSubnetRange": {
-    "Description": "Address range for app service subnet. Not used if subnet already exists.",
+    "Description": "Address range for app service subnet. Ignored if subnet already exists.",
     "IsRequired": false,
     "DefaultValue": "10.250.251.0/28"
   },
@@ -71,7 +73,7 @@ endpoint vnet.
     "DefaultValue": "false"
   },
   "PeerVnetIds": {
-    "Description": "Optional. Values are 'All' or comma-separated list of Azure resource IDs of VNets to peer to private endpoint VNet. If 'All' then all VNets NME manages will be peered. The VNEts or their resource groups must be linked to Nerdio Manager in Settings->Azure environment. All VNets must be in the same subscription as Nerdio Manager. External VNets must be peered manually.",
+    "Description": "Optional. Values are 'All' or comma-separated list of Azure resource IDs of VNets to peer to private endpoint VNet. If 'All' then all linked VNets will be peered. The VNETs or their resource groups must be linked to Nerdio Manager in Settings->Azure environment. All VNets must be in the same subscription as Nerdio Manager. External VNets must be peered manually.",
     "IsRequired": false,
     "DefaultValue": ""
   },
